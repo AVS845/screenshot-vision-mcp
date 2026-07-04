@@ -60,8 +60,28 @@ async function ensureOllama(): Promise<void> {
   await startOllama();
 }
 
+async function ensureModel(model: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: AbortSignal.timeout(5000) });
+  } catch {
+    return; // Ollama unreachable — let the generate call surface the error
+  }
+  if (!res.ok) return;
+  const data = (await res.json()) as { models?: { name: string }[] };
+  const available = (data.models ?? []).map(m => m.name);
+  const found = available.some(name => name === model || name.startsWith(`${model}:`));
+  if (!found) {
+    throw new Error(
+      `Model "${model}" is not available in Ollama. Run: ollama pull ${model}\n` +
+      `Available models: ${available.length ? available.join(", ") : "(none)"}`
+    );
+  }
+}
+
 async function queryOllama(imageBase64: string | string[], question: string, model: string): Promise<string> {
   await ensureOllama();
+  await ensureModel(model);
 
   const images = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
 
@@ -94,6 +114,7 @@ async function queryOllama(imageBase64: string | string[], question: string, mod
 
 async function queryOllamaJson<T>(imageBase64: string, prompt: string, model: string): Promise<T> {
   await ensureOllama();
+  await ensureModel(model);
 
   let ollamaResponse: Response;
   try {
