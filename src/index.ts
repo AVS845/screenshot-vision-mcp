@@ -5,7 +5,7 @@ import { z } from "zod";
 import { chromium } from "playwright";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
-import { mkdtempSync, rmSync, readFileSync } from "fs";
+import { mkdtempSync, rmSync, readFileSync, copyFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -89,6 +89,43 @@ async function queryOllama(imageBase64: string, question: string, model: string)
   if (data.error) throw new Error(`Ollama model error: ${data.error}`);
   return data.response;
 }
+
+async function queryOllamaJson<T>(imageBase64: string, prompt: string, model: string): Promise<T> {
+  await ensureOllama();
+
+  let ollamaResponse: Response;
+  try {
+    ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        prompt,
+        images: [imageBase64],
+        stream: false,
+        format: "json",
+      }),
+      signal: AbortSignal.timeout(120000),
+    });
+  } catch (err) {
+    throw new Error(`Ollama request failed: ${String(err)}`);
+  }
+
+  if (!ollamaResponse.ok) {
+    const body = await ollamaResponse.text();
+    throw new Error(`Ollama returned ${ollamaResponse.status}: ${body}`);
+  }
+
+  const data = (await ollamaResponse.json()) as { response: string; error?: string };
+  if (data.error) throw new Error(`Ollama model error: ${data.error}`);
+
+  try {
+    return JSON.parse(data.response) as T;
+  } catch {
+    throw new Error(`Ollama returned invalid JSON: ${data.response.slice(0, 200)}`);
+  }
+}
+
 
 // Tool 1: Screenshot a URL in a fresh headless browser (no session/cookies)
 server.tool(
@@ -223,6 +260,179 @@ server.tool(
           {
             type: "text" as const,
             text: `**Window capture of "${app_name}"**${modifiers ? ` [${modifiers}]` : ""}\n\n**Question:** ${question}\n\n**Analysis (${model!}):**\n\n${analysis}`,
+          },
+        ],
+      };
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+);
+
+// Tool 3: Find a UI element and return click coordinates — Claude never sees the image
+server.tool(
+  "locate_element",
+  "Find a UI element in an app window and return its click coordinates. Uses a local Ollama vision model — Claude never sees the image. " +
+  "For Google Chrome, pass viewport_bounds (computed from javascript_tool: {x: screenX, y: screenY + outerHeight - innerHeight, width: innerWidth, height: innerHeight}) " +
+  "to get viewport-relative coordinates usable directly with the Chrome computer tool. Without viewport_bounds, returns absolute screen coordinates.",
+  {
+    app_name: z.string().describe("Exact macOS app name, e.g. 'Google Chrome', 'Safari', 'Terminal', 'Cursor'"),
+    element_description: z.string().describe("Natural language description of the element to find, e.g. 'the X close button in the top-right of the modal'"),
+    model: z.string().optional().default("gemma4:e4b").describe("Ollama vision model to use"),
+    window_index: z.number().int().min(1).optional().default(1).describe("Which window to capture if the app has multiple (1 = frontmost)"),
+    zoom: z.boolean().optional().default(false).describe("Two-pass zoom: first locate a rough bounding box, then crop and refine. More accurate for small elements like close buttons or icons."),
+    viewport_bounds: z.object({
+      x: z.number().describe("Left edge of viewport in screen coordinates"),
+      y: z.number().describe("Top edge of viewport in screen coordinates"),
+      width: z.number().describe("Viewport width in logical pixels"),
+      height: z.number().describe("Viewport height in logical pixels"),
+    }).optional().describe(
+      "Screen-coordinate bounds of the region to capture (e.g. Chrome's content area). " +
+      "For Chrome: compute as {x: screenX, y: screenY + outerHeight - innerHeight, width: innerWidth, height: innerHeight} " +
+      "using window.screenX/Y/outerWidth/outerHeight/innerWidth/innerHeight from javascript_tool. " +
+      "When provided, returned coordinates are relative to this region's (0,0) — viewport-relative for Chrome."
+    ),
+  },
+  async ({ app_name, element_description, model, window_index, zoom, viewport_bounds }) => {
+    // --- Determine capture region ---
+    // If viewport_bounds is provided, capture exactly that region and return coords relative to its (0,0).
+    // Otherwise, fall back to full window bounds and return absolute screen coordinates.
+
+    let captureLeft: number;
+    let captureTop: number;
+    let captureWidth: number;
+    let captureHeight: number;
+    let coordinateMode: "viewport" | "screen";
+
+    if (viewport_bounds) {
+      captureLeft = viewport_bounds.x;
+      captureTop = viewport_bounds.y;
+      captureWidth = viewport_bounds.width;
+      captureHeight = viewport_bounds.height;
+      coordinateMode = "viewport";
+    } else {
+      let boundsStr: string;
+      try {
+        const result = await execFileAsync("osascript", [
+          "-e", `tell application "${app_name}" to return bounds of window ${window_index!}`,
+        ]);
+        boundsStr = result.stdout.trim();
+      } catch (err) {
+        throw new Error(
+          `Could not get window bounds for "${app_name}". Is it open? App name must match exactly. ${String(err)}`
+        );
+      }
+      const p = boundsStr.split(",").map(s => parseInt(s.trim(), 10));
+      if (p.length !== 4 || p.some(isNaN)) throw new Error(`Unexpected bounds format: "${boundsStr}"`);
+      captureLeft = p[0]; captureTop = p[1];
+      captureWidth = p[2] - p[0]; captureHeight = p[3] - p[1];
+      coordinateMode = "screen";
+    }
+
+    // Bring window to front and capture the region
+    await execFileAsync("osascript", ["-e", `tell application "${app_name}" to activate`]);
+
+    const tmpDir = mkdtempSync(join(tmpdir(), "screenshot-mcp-locate-"));
+    const screenshotPath = join(tmpDir, "capture.png");
+
+    try {
+      const region = `${captureLeft},${captureTop},${captureWidth},${captureHeight}`;
+      await execFileAsync("screencapture", ["-x", "-R", region, screenshotPath]);
+
+      // Physical pixel dimensions (Retina = 2× logical)
+      const sipsInfo = await execFileAsync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", screenshotPath]);
+      const wMatch = sipsInfo.stdout.match(/pixelWidth: (\d+)/);
+      const hMatch = sipsInfo.stdout.match(/pixelHeight: (\d+)/);
+      const imgWidth = wMatch ? parseInt(wMatch[1]) : captureWidth;
+      const imgHeight = hMatch ? parseInt(hMatch[1]) : captureHeight;
+
+      let fracX: number;
+      let fracY: number;
+
+      if (zoom) {
+        // Pass 1 — rough bounding box
+        const roughPrompt =
+          `Find this UI element in the screenshot: "${element_description}"\n\n` +
+          `Return ONLY valid JSON (no other text):\n` +
+          `{"x": <left edge 0-1>, "y": <top edge 0-1>, "width": <width 0-1>, "height": <height 0-1>}\n\n` +
+          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Cover the element with some padding.`;
+
+        const rough = await queryOllamaJson<{ x: number; y: number; width: number; height: number }>(
+          readFileSync(screenshotPath).toString("base64"), roughPrompt, model!
+        );
+
+        const rx = Math.max(0, Math.min(0.99, rough.x ?? 0));
+        const ry = Math.max(0, Math.min(0.99, rough.y ?? 0));
+        const rw = Math.max(0.01, Math.min(1 - rx, rough.width ?? 0.1));
+        const rh = Math.max(0.01, Math.min(1 - ry, rough.height ?? 0.1));
+
+        // Crop to the rough region for a closer look
+        const cropX = Math.round(rx * imgWidth);
+        const cropY = Math.round(ry * imgHeight);
+        const cropW = Math.max(1, Math.round(rw * imgWidth));
+        const cropH = Math.max(1, Math.round(rh * imgHeight));
+
+        const croppedPath = join(tmpDir, "cropped.png");
+        copyFileSync(screenshotPath, croppedPath);
+        await execFileAsync("sips", [
+          "--cropToHeightWidth", String(cropH), String(cropW),
+          "--cropOffset", String(cropY), String(cropX),
+          croppedPath, "--out", croppedPath,
+        ]);
+
+        // Pass 2 — precise center within the crop
+        const precisePrompt =
+          `This is a zoomed-in region of a UI screenshot. Find: "${element_description}"\n\n` +
+          `Return ONLY valid JSON (no other text):\n` +
+          `{"x": <center x 0-1>, "y": <center y 0-1>}\n\n` +
+          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom of THIS cropped image. Return the CENTER of the element.`;
+
+        const precise = await queryOllamaJson<{ x: number; y: number }>(
+          readFileSync(croppedPath).toString("base64"), precisePrompt, model!
+        );
+
+        const px = Math.max(0, Math.min(1, precise.x ?? 0.5));
+        const py = Math.max(0, Math.min(1, precise.y ?? 0.5));
+
+        // Convert crop-relative fractions back to full-capture fractions
+        fracX = rx + px * rw;
+        fracY = ry + py * rh;
+      } else {
+        // Single pass
+        const prompt =
+          `Find this UI element in the screenshot: "${element_description}"\n\n` +
+          `Return ONLY valid JSON (no other text):\n` +
+          `{"x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
+          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Return the CENTER point of the element.`;
+
+        const result = await queryOllamaJson<{ x: number; y: number; confidence?: string }>(
+          readFileSync(screenshotPath).toString("base64"), prompt, model!
+        );
+
+        fracX = Math.max(0, Math.min(1, result.x ?? 0.5));
+        fracY = Math.max(0, Math.min(1, result.y ?? 0.5));
+      }
+
+      // Convert fractions to output coordinates.
+      // Retina scale cancels out: fractions of physical pixels = fractions of logical pixels.
+      let x: number;
+      let y: number;
+
+      if (coordinateMode === "viewport") {
+        // Relative to the captured region's (0,0) — viewport coordinates for Chrome
+        x = Math.round(fracX * captureWidth);
+        y = Math.round(fracY * captureHeight);
+      } else {
+        // Absolute screen coordinates
+        x = Math.round(captureLeft + fracX * captureWidth);
+        y = Math.round(captureTop + fracY * captureHeight);
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ x, y, coordinate_mode: coordinateMode }),
           },
         ],
       };
