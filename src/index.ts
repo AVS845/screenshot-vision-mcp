@@ -507,6 +507,17 @@ server.tool(
           croppedPath, "--out", croppedPath,
         ]);
 
+        // Upscale small crops so the model's 280-token image budget isn't wasted
+        // on a tiny region. Target a minimum of 400px on the short side.
+        const minSide = Math.min(cropW, cropH);
+        if (minSide < 400) {
+          const upscale = Math.ceil(400 / minSide);
+          await execFileAsync("sips", [
+            "-z", String(cropH * upscale), String(cropW * upscale),
+            croppedPath, "--out", croppedPath,
+          ]);
+        }
+
         // Pass 2 — precise center within the crop
         const precisePrompt =
           `This is a zoomed-in region of a UI screenshot. Find: "${element_description}"\n\n` +
