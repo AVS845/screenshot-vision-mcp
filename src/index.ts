@@ -17,6 +17,7 @@ const server = new McpServer({
 });
 
 const OLLAMA_BASE_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
+const OLLAMA_DEFAULT_MODEL = process.env.OLLAMA_MODEL ?? "gemma4:e4b";
 
 async function isOllamaRunning(): Promise<boolean> {
   try {
@@ -198,7 +199,7 @@ server.tool(
   {
     url: z.string().url().describe("URL to screenshot (e.g. http://localhost:3004)"),
     question: z.string().describe("What to analyze or look for in the screenshot"),
-    model: z.string().optional().default("gemma4:e4b").describe("Ollama vision model to use"),
+    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (overrides OLLAMA_MODEL env var)"),
     viewport_width: z.number().int().positive().optional().default(1280).describe("Viewport width in pixels"),
     viewport_height: z.number().int().positive().optional().default(800).describe("Viewport height in pixels"),
     wait_ms: z.number().int().min(0).optional().default(2000).describe("Milliseconds to wait after page load for JS rendering"),
@@ -306,7 +307,7 @@ server.tool(
   {
     app_name: z.string().describe("Exact macOS app name, e.g. 'Google Chrome', 'Safari', 'Terminal', 'Cursor'"),
     question: z.string().describe("What to analyze or look for in the screenshot"),
-    model: z.string().optional().default("gemma4:e4b").describe("Ollama vision model to use"),
+    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (overrides OLLAMA_MODEL env var)"),
     window_index: z.number().int().min(1).optional().default(1).describe("Which window to capture if the app has multiple (1 = frontmost)"),
     scale: z.number().int().min(1).max(4).optional().default(1).describe("Upscale factor applied before sending to the vision model. Use 2 or 3 for small terminal text or dense UIs."),
     crop: z.object({
@@ -408,7 +409,7 @@ server.tool(
   {
     app_name: z.string().describe("Exact macOS app name, e.g. 'Google Chrome', 'Safari', 'Terminal', 'Cursor'"),
     element_description: z.string().describe("Natural language description of the element to find, e.g. 'the X close button in the top-right of the modal'"),
-    model: z.string().optional().default("gemma4:e4b").describe("Ollama vision model to use"),
+    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (overrides OLLAMA_MODEL env var)"),
     window_index: z.number().int().min(1).optional().default(1).describe("Which window to capture if the app has multiple (1 = frontmost)"),
     zoom: z.boolean().optional().default(false).describe("Two-pass zoom: first locate a rough bounding box, then crop and refine. More accurate for small elements like close buttons or icons."),
     viewport_bounds: z.object({

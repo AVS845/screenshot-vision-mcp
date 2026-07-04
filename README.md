@@ -52,7 +52,12 @@ Add this to your `~/.claude/settings.json` under `mcpServers`:
 
 Replace `/absolute/path/to/` with the actual path. Then restart Claude Code.
 
-To use a different Ollama host, add an env override:
+Two optional env vars let you configure the server without touching call sites:
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama host |
+| `OLLAMA_MODEL` | `gemma4:e4b` | Default vision model for all tools |
 
 ```json
 {
@@ -61,7 +66,8 @@ To use a different Ollama host, add an env override:
       "command": "node",
       "args": ["/absolute/path/to/screenshot-vision-mcp/dist/index.js"],
       "env": {
-        "OLLAMA_URL": "http://192.168.1.10:11434"
+        "OLLAMA_URL": "http://192.168.1.10:11434",
+        "OLLAMA_MODEL": "llava"
       }
     }
   }
