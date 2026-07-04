@@ -511,12 +511,17 @@ server.tool(
         const precisePrompt =
           `This is a zoomed-in region of a UI screenshot. Find: "${element_description}"\n\n` +
           `Return ONLY valid JSON (no other text):\n` +
-          `{"x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
-          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom of THIS cropped image. Return the CENTER of the element.`;
+          `{"found": true|false, "x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
+          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom of THIS cropped image. Return the CENTER of the element. ` +
+          `Set found to false if the element is not visible.`;
 
-        const precise = await queryOllamaJson<{ x: number; y: number; confidence?: string }>(
+        const precise = await queryOllamaJson<{ found?: boolean; x: number; y: number; confidence?: string }>(
           readFileSync(croppedPath).toString("base64"), precisePrompt, model!
         );
+
+        if (precise.found === false) {
+          throw new Error(`Element not found: "${element_description}"`);
+        }
 
         const px = Math.max(0, Math.min(1, precise.x ?? 0.5));
         const py = Math.max(0, Math.min(1, precise.y ?? 0.5));
@@ -530,12 +535,17 @@ server.tool(
         const prompt =
           `Find this UI element in the screenshot: "${element_description}"\n\n` +
           `Return ONLY valid JSON (no other text):\n` +
-          `{"x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
-          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Return the CENTER point of the element.`;
+          `{"found": true|false, "x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
+          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Return the CENTER point of the element. ` +
+          `Set found to false if the element is not visible.`;
 
-        const result = await queryOllamaJson<{ x: number; y: number; confidence?: string }>(
+        const result = await queryOllamaJson<{ found?: boolean; x: number; y: number; confidence?: string }>(
           readFileSync(screenshotPath).toString("base64"), prompt, model!
         );
+
+        if (result.found === false) {
+          throw new Error(`Element not found: "${element_description}"`);
+        }
 
         fracX = Math.max(0, Math.min(1, result.x ?? 0.5));
         fracY = Math.max(0, Math.min(1, result.y ?? 0.5));
