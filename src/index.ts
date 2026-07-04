@@ -439,6 +439,7 @@ server.tool(
 
       let fracX: number;
       let fracY: number;
+      let confidence: string | undefined;
 
       if (zoom) {
         // Pass 1 — rough bounding box
@@ -475,10 +476,10 @@ server.tool(
         const precisePrompt =
           `This is a zoomed-in region of a UI screenshot. Find: "${element_description}"\n\n` +
           `Return ONLY valid JSON (no other text):\n` +
-          `{"x": <center x 0-1>, "y": <center y 0-1>}\n\n` +
+          `{"x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
           `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom of THIS cropped image. Return the CENTER of the element.`;
 
-        const precise = await queryOllamaJson<{ x: number; y: number }>(
+        const precise = await queryOllamaJson<{ x: number; y: number; confidence?: string }>(
           readFileSync(croppedPath).toString("base64"), precisePrompt, model!
         );
 
@@ -488,6 +489,7 @@ server.tool(
         // Convert crop-relative fractions back to full-capture fractions
         fracX = rx + px * rw;
         fracY = ry + py * rh;
+        confidence = precise.confidence;
       } else {
         // Single pass
         const prompt =
@@ -502,6 +504,7 @@ server.tool(
 
         fracX = Math.max(0, Math.min(1, result.x ?? 0.5));
         fracY = Math.max(0, Math.min(1, result.y ?? 0.5));
+        confidence = result.confidence;
       }
 
       // Convert fractions to output coordinates.
@@ -523,7 +526,7 @@ server.tool(
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ x, y, coordinate_mode: coordinateMode }),
+            text: JSON.stringify({ x, y, coordinate_mode: coordinateMode, ...(confidence ? { confidence } : {}) }),
           },
         ],
       };
