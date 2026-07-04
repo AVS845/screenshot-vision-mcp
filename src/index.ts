@@ -126,6 +126,41 @@ async function queryOllamaJson<T>(imageBase64: string, prompt: string, model: st
   }
 }
 
+// Brings appName to the front only if it isn't already frontmost, runs fn (which should
+// call screencapture), then immediately restores the previous frontmost app so the user's
+// focus is not disrupted. Restores before Ollama processing, not after, so the window
+// flash is as short as possible.
+async function withFocus<T>(appName: string, fn: () => Promise<T>): Promise<T> {
+  let previousApp: string | null = null;
+
+  try {
+    const result = await execFileAsync("osascript", [
+      "-e", "tell application \"System Events\" to return name of first process whose frontmost is true",
+    ]);
+    const current = result.stdout.trim();
+    if (current.toLowerCase() !== appName.toLowerCase()) {
+      previousApp = current;
+      await execFileAsync("osascript", ["-e", `tell application "${appName}" to activate`]);
+      // Brief wait for the window to finish coming forward before screencapture fires.
+      await new Promise(r => setTimeout(r, 150));
+    }
+  } catch {
+    // If we can't determine the frontmost app, activate unconditionally.
+    await execFileAsync("osascript", ["-e", `tell application "${appName}" to activate`]);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    if (previousApp) {
+      try {
+        await execFileAsync("osascript", ["-e", `tell application "${previousApp}" to activate`]);
+      } catch {
+        // Ignore — restoring focus is best-effort.
+      }
+    }
+  }
+}
 
 // Tool 1: Screenshot a URL in a fresh headless browser (no session/cookies)
 server.tool(
@@ -207,15 +242,14 @@ server.tool(
     const [left, top, right, bottom] = parts;
     const region = `${left},${top},${right - left},${bottom - top}`;
 
-    // Bring the window to front, then capture just its region
-    await execFileAsync("osascript", ["-e", `tell application "${app_name}" to activate`]);
-
     const tmpDir = mkdtempSync(join(tmpdir(), "screenshot-mcp-"));
     const screenshotPath = join(tmpDir, "window.png");
 
     try {
-      // -x suppresses the shutter sound/animation, -R captures a specific region
-      await execFileAsync("screencapture", ["-x", "-R", region, screenshotPath]);
+      // Activate only if needed; restore previous focus immediately after capture.
+      await withFocus(app_name, () =>
+        execFileAsync("screencapture", ["-x", "-R", region, screenshotPath])
+      );
 
       // Get actual pixel dimensions of the captured image (Retina = 2x logical size)
       const sipsInfo = await execFileAsync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", screenshotPath]);
@@ -329,15 +363,15 @@ server.tool(
       coordinateMode = "screen";
     }
 
-    // Bring window to front and capture the region
-    await execFileAsync("osascript", ["-e", `tell application "${app_name}" to activate`]);
-
     const tmpDir = mkdtempSync(join(tmpdir(), "screenshot-mcp-locate-"));
     const screenshotPath = join(tmpDir, "capture.png");
 
     try {
       const region = `${captureLeft},${captureTop},${captureWidth},${captureHeight}`;
-      await execFileAsync("screencapture", ["-x", "-R", region, screenshotPath]);
+      // Activate only if needed; restore previous focus immediately after capture.
+      await withFocus(app_name, () =>
+        execFileAsync("screencapture", ["-x", "-R", region, screenshotPath])
+      );
 
       // Physical pixel dimensions (Retina = 2× logical)
       const sipsInfo = await execFileAsync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", screenshotPath]);
