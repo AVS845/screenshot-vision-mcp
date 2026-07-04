@@ -84,6 +84,8 @@ async function queryOllama(imageBase64: string | string[], question: string, mod
   await ensureModel(model);
 
   const images = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
+  // Allow 60 s base + 30 s per image so multi-slice full-page requests don't time out.
+  const timeoutMs = (60 + images.length * 30) * 1000;
 
   let ollamaResponse: Response;
   try {
@@ -96,7 +98,7 @@ async function queryOllama(imageBase64: string | string[], question: string, mod
         images,
         stream: false,
       }),
-      signal: AbortSignal.timeout(120000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     throw new Error(`Ollama request failed: ${String(err)}`);
