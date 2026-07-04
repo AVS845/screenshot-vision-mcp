@@ -60,7 +60,10 @@ async function ensureOllama(): Promise<void> {
   await startOllama();
 }
 
+const verifiedModels = new Set<string>();
+
 async function ensureModel(model: string): Promise<void> {
+  if (verifiedModels.has(model)) return;
   let res: Response;
   try {
     res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: AbortSignal.timeout(5000) });
@@ -77,6 +80,7 @@ async function ensureModel(model: string): Promise<void> {
       `Available models: ${available.length ? available.join(", ") : "(none)"}`
     );
   }
+  verifiedModels.add(model);
 }
 
 async function queryOllama(imageBase64: string | string[], question: string, model: string): Promise<string> {
