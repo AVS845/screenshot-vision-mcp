@@ -5,7 +5,7 @@ import { z } from "zod";
 import { chromium } from "playwright";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
-import { mkdtempSync, rmSync, readFileSync, copyFileSync } from "fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, copyFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -60,8 +60,10 @@ async function ensureOllama(): Promise<void> {
   await startOllama();
 }
 
-async function queryOllama(imageBase64: string, question: string, model: string): Promise<string> {
+async function queryOllama(imageBase64: string | string[], question: string, model: string): Promise<string> {
   await ensureOllama();
+
+  const images = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
 
   let ollamaResponse: Response;
   try {
@@ -71,7 +73,7 @@ async function queryOllama(imageBase64: string, question: string, model: string)
       body: JSON.stringify({
         model,
         prompt: question,
-        images: [imageBase64],
+        images,
         stream: false,
       }),
       signal: AbortSignal.timeout(120000),
@@ -165,7 +167,7 @@ async function withFocus<T>(appName: string, fn: () => Promise<T>): Promise<T> {
 // Tool 1: Screenshot a URL in a fresh headless browser (no session/cookies)
 server.tool(
   "analyze_screenshot",
-  "Take a screenshot of a URL in a headless browser and analyze it with a local Ollama vision model. Good for public pages. For pages requiring login, use capture_window instead.",
+  "Take a screenshot of a URL in a headless browser and analyze it with a local Ollama vision model. Good for public pages. For pages requiring login, use capture_window instead. Use full_page: true to capture content below the fold — the page is sliced into segments and sent as multiple images so no detail is lost.",
   {
     url: z.string().url().describe("URL to screenshot (e.g. http://localhost:3004)"),
     question: z.string().describe("What to analyze or look for in the screenshot"),
@@ -173,10 +175,13 @@ server.tool(
     viewport_width: z.number().int().positive().optional().default(1280).describe("Viewport width in pixels"),
     viewport_height: z.number().int().positive().optional().default(800).describe("Viewport height in pixels"),
     wait_ms: z.number().int().min(0).optional().default(2000).describe("Milliseconds to wait after page load for JS rendering"),
+    full_page: z.boolean().optional().default(false).describe("Capture the full page height, not just the visible viewport. Long pages are sliced into segments sent as multiple images so detail is preserved at every scroll depth."),
+    max_slices: z.number().int().min(1).max(20).optional().default(8).describe("Maximum number of slices when full_page is true. Slices are distributed evenly across the page height. Default 8 covers most pages well."),
   },
-  async ({ url, question, model, viewport_width, viewport_height, wait_ms }) => {
+  async ({ url, question, model, viewport_width, viewport_height, wait_ms, full_page, max_slices }) => {
     const browser = await chromium.launch({ headless: true });
-    let imageBase64: string;
+    let images: string[];
+    let sliceCount = 1;
 
     try {
       const context = await browser.newContext({
@@ -185,18 +190,70 @@ server.tool(
       const page = await context.newPage();
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
       if (wait_ms! > 0) await page.waitForTimeout(wait_ms!);
-      const buffer = await page.screenshot({ type: "png" });
-      imageBase64 = buffer.toString("base64");
+
+      if (!full_page) {
+        const buffer = await page.screenshot({ type: "png" });
+        images = [buffer.toString("base64")];
+      } else {
+        const fullBuffer = await page.screenshot({ type: "png", fullPage: true });
+        const tmpDir = mkdtempSync(join(tmpdir(), "screenshot-mcp-full-"));
+        try {
+          const fullPagePath = join(tmpDir, "full.png");
+          writeFileSync(fullPagePath, fullBuffer);
+
+          const sipsInfo = await execFileAsync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", fullPagePath]);
+          const wMatch = sipsInfo.stdout.match(/pixelWidth: (\d+)/);
+          const hMatch = sipsInfo.stdout.match(/pixelHeight: (\d+)/);
+          const imgWidth = wMatch ? parseInt(wMatch[1]) : viewport_width!;
+          const pageHeight = hMatch ? parseInt(hMatch[1]) : viewport_height!;
+          const sliceH = viewport_height!;
+
+          if (pageHeight <= sliceH) {
+            // Page fits in one viewport — no slicing needed
+            images = [fullBuffer.toString("base64")];
+          } else {
+            // Distribute N slices evenly across the full page height.
+            // Ollama locks Gemma 4 to a 280-token image budget, so a single tall image
+            // loses most of its detail. Sending N properly-proportioned slices avoids this.
+            const N = Math.min(max_slices!, Math.ceil(pageHeight / sliceH));
+            const stride = N > 1 ? Math.floor((pageHeight - sliceH) / (N - 1)) : 0;
+
+            const sliceBase64s: string[] = [];
+            for (let i = 0; i < N; i++) {
+              const offsetY = i === N - 1 ? Math.max(0, pageHeight - sliceH) : i * stride;
+              const actualH = Math.min(sliceH, pageHeight - offsetY);
+              const slicePath = join(tmpDir, `slice_${i}.png`);
+              copyFileSync(fullPagePath, slicePath);
+              await execFileAsync("sips", [
+                "--cropToHeightWidth", String(actualH), String(imgWidth),
+                "--cropOffset", String(offsetY), "0",
+                slicePath, "--out", slicePath,
+              ]);
+              sliceBase64s.push(readFileSync(slicePath).toString("base64"));
+            }
+            images = sliceBase64s;
+            sliceCount = N;
+          }
+        } finally {
+          rmSync(tmpDir, { recursive: true, force: true });
+        }
+      }
     } finally {
       await browser.close();
     }
 
-    const analysis = await queryOllama(imageBase64, question, model!);
+    // Prepend slice context so the model knows it's reading a sequence of page segments.
+    const effectiveQuestion = sliceCount > 1
+      ? `You are analyzing ${sliceCount} slices of a full web page, ordered top to bottom. Slice 1 is the topmost portion and slice ${sliceCount} is the bottommost.\n\n${question}`
+      : question;
+
+    const analysis = await queryOllama(images, effectiveQuestion, model!);
+    const label = sliceCount > 1 ? ` [full-page, ${sliceCount} slices]` : "";
     return {
       content: [
         {
           type: "text" as const,
-          text: `**Screenshot analysis of ${url}**\n\n**Question:** ${question}\n\n**Analysis (${model!}):**\n\n${analysis}`,
+          text: `**Screenshot analysis of ${url}**${label}\n\n**Question:** ${question}\n\n**Analysis (${model!}):**\n\n${analysis}`,
         },
       ],
     };

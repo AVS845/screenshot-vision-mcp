@@ -84,6 +84,10 @@ Takes a screenshot of a URL in a headless Playwright browser and analyzes it.
 | `viewport_width` | number | `1280` | Viewport width in px |
 | `viewport_height` | number | `800` | Viewport height in px |
 | `wait_ms` | number | `2000` | Wait after page load (ms) |
+| `full_page` | boolean | `false` | Capture the full page height, not just the visible viewport |
+| `max_slices` | number | `8` | Max slices when `full_page` is true (1–20) |
+
+When `full_page: true`, the tool captures the entire page as one tall PNG, then slices it into `viewport_height`-tall segments distributed evenly from top to bottom. Each slice is sent as a separate image in a single Ollama request, with a prompt that tells the model the slice order. This matters because Ollama caps Gemma 4's image token budget at 280 tokens — a single tall image gets crushed into noise, while N properly-proportioned slices each get full detail.
 
 ### `capture_window`
 
