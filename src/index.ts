@@ -216,6 +216,18 @@ server.tool(
         const buffer = await page.screenshot({ type: "png" });
         images = [buffer.toString("base64")];
       } else {
+        // Scroll through the page in viewport-height steps before capturing so that
+        // lazy-loaded images and sections have a chance to load. Then scroll back to
+        // the top so the final screenshot starts from position 0.
+        const scrollHeight = await page.evaluate(() => document.body.scrollHeight);
+        const step = viewport_height!;
+        for (let y = step; y < scrollHeight; y += step) {
+          await page.evaluate((pos) => window.scrollTo(0, pos), y);
+          await page.waitForTimeout(150);
+        }
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await page.waitForTimeout(200);
+
         const fullBuffer = await page.screenshot({ type: "png", fullPage: true });
         const tmpDir = mkdtempSync(join(tmpdir(), "screenshot-mcp-full-"));
         try {
