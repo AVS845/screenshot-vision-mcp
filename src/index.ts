@@ -488,10 +488,11 @@ server.tool(
       const imgWidth = wMatch ? parseInt(wMatch[1]) : captureWidth;
       const imgHeight = hMatch ? parseInt(hMatch[1]) : captureHeight;
 
-      let fracX: number;
-      let fracY: number;
+      let fracX = 0;
+      let fracY = 0;
       let confidence: string | undefined;
       let clamped = false;
+      let zoomSucceeded = false;
 
       if (zoom) {
         // Pass 1 — rough bounding box
@@ -506,73 +507,75 @@ server.tool(
           readFileSync(screenshotPath).toString("base64"), roughPrompt, model!
         );
 
-        if (rough.found === false) {
-          throw new Error(`Element not found: "${element_description}"`);
-        }
+        if (rough.found !== false) {
+          const rawRx = rough.x ?? 0;
+          const rawRy = rough.y ?? 0;
+          const rawRw = rough.width ?? 0.1;
+          const rawRh = rough.height ?? 0.1;
+          const rx = Math.max(0, Math.min(0.99, rawRx));
+          const ry = Math.max(0, Math.min(0.99, rawRy));
+          const rw = Math.max(0.01, Math.min(1 - rx, rawRw));
+          const rh = Math.max(0.01, Math.min(1 - ry, rawRh));
+          clamped = rx !== rawRx || ry !== rawRy || rw !== rawRw || rh !== rawRh;
 
-        const rawRx = rough.x ?? 0;
-        const rawRy = rough.y ?? 0;
-        const rawRw = rough.width ?? 0.1;
-        const rawRh = rough.height ?? 0.1;
-        const rx = Math.max(0, Math.min(0.99, rawRx));
-        const ry = Math.max(0, Math.min(0.99, rawRy));
-        const rw = Math.max(0.01, Math.min(1 - rx, rawRw));
-        const rh = Math.max(0.01, Math.min(1 - ry, rawRh));
-        clamped = rx !== rawRx || ry !== rawRy || rw !== rawRw || rh !== rawRh;
+          // Crop to the rough region for a closer look
+          const cropX = Math.round(rx * imgWidth);
+          const cropY = Math.round(ry * imgHeight);
+          const cropW = Math.max(1, Math.round(rw * imgWidth));
+          const cropH = Math.max(1, Math.round(rh * imgHeight));
 
-        // Crop to the rough region for a closer look
-        const cropX = Math.round(rx * imgWidth);
-        const cropY = Math.round(ry * imgHeight);
-        const cropW = Math.max(1, Math.round(rw * imgWidth));
-        const cropH = Math.max(1, Math.round(rh * imgHeight));
-
-        const croppedPath = join(tmpDir, "cropped.png");
-        copyFileSync(screenshotPath, croppedPath);
-        await execFileAsync("sips", [
-          "--cropToHeightWidth", String(cropH), String(cropW),
-          "--cropOffset", String(cropY), String(cropX),
-          croppedPath, "--out", croppedPath,
-        ]);
-
-        // Upscale small crops so the model's 280-token image budget isn't wasted
-        // on a tiny region. Target a minimum of 400px on the short side.
-        const minSide = Math.min(cropW, cropH);
-        if (minSide < 400) {
-          const upscale = Math.ceil(400 / minSide);
+          const croppedPath = join(tmpDir, "cropped.png");
+          copyFileSync(screenshotPath, croppedPath);
           await execFileAsync("sips", [
-            "-z", String(cropH * upscale), String(cropW * upscale),
+            "--cropToHeightWidth", String(cropH), String(cropW),
+            "--cropOffset", String(cropY), String(cropX),
             croppedPath, "--out", croppedPath,
           ]);
+
+          // Upscale small crops so the model's 280-token image budget isn't wasted
+          // on a tiny region. Target a minimum of 400px on the short side.
+          const minSide = Math.min(cropW, cropH);
+          if (minSide < 400) {
+            const upscale = Math.ceil(400 / minSide);
+            await execFileAsync("sips", [
+              "-z", String(cropH * upscale), String(cropW * upscale),
+              croppedPath, "--out", croppedPath,
+            ]);
+          }
+
+          // Pass 2 — precise center within the crop
+          const precisePrompt =
+            `This is a zoomed-in region of a UI screenshot. Find: "${element_description}"\n\n` +
+            `Return ONLY valid JSON (no other text):\n` +
+            `{"found": true|false, "x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
+            `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom of THIS cropped image. Return the CENTER of the element. ` +
+            `Set found to false if the element is not visible.`;
+
+          const precise = await queryOllamaJson<{ found?: boolean; x: number; y: number; confidence?: string }>(
+            readFileSync(croppedPath).toString("base64"), precisePrompt, model!
+          );
+
+          if (precise.found === false) {
+            throw new Error(`Element not found: "${element_description}"`);
+          }
+
+          const rawPx = precise.x ?? 0.5;
+          const rawPy = precise.y ?? 0.5;
+          const px = Math.max(0, Math.min(1, rawPx));
+          const py = Math.max(0, Math.min(1, rawPy));
+          clamped = clamped || px !== rawPx || py !== rawPy;
+
+          // Convert crop-relative fractions back to full-capture fractions
+          fracX = rx + px * rw;
+          fracY = ry + py * rh;
+          confidence = precise.confidence;
+          zoomSucceeded = true;
         }
+        // if rough.found === false: zoomSucceeded stays false, single-pass runs below
+      }
 
-        // Pass 2 — precise center within the crop
-        const precisePrompt =
-          `This is a zoomed-in region of a UI screenshot. Find: "${element_description}"\n\n` +
-          `Return ONLY valid JSON (no other text):\n` +
-          `{"found": true|false, "x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
-          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom of THIS cropped image. Return the CENTER of the element. ` +
-          `Set found to false if the element is not visible.`;
-
-        const precise = await queryOllamaJson<{ found?: boolean; x: number; y: number; confidence?: string }>(
-          readFileSync(croppedPath).toString("base64"), precisePrompt, model!
-        );
-
-        if (precise.found === false) {
-          throw new Error(`Element not found: "${element_description}"`);
-        }
-
-        const rawPx = precise.x ?? 0.5;
-        const rawPy = precise.y ?? 0.5;
-        const px = Math.max(0, Math.min(1, rawPx));
-        const py = Math.max(0, Math.min(1, rawPy));
-        clamped = clamped || px !== rawPx || py !== rawPy;
-
-        // Convert crop-relative fractions back to full-capture fractions
-        fracX = rx + px * rw;
-        fracY = ry + py * rh;
-        confidence = precise.confidence;
-      } else {
-        // Single pass
+      if (!zoom || !zoomSucceeded) {
+        // Single pass (also used as fallback when zoom pass-1 returns found:false)
         const prompt =
           `Find this UI element in the screenshot: "${element_description}"\n\n` +
           `Return ONLY valid JSON (no other text):\n` +
