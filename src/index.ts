@@ -422,7 +422,6 @@ server.tool(
     element_description: z.string().describe("Natural language description of the element to find, e.g. 'the X close button in the top-right of the modal'"),
     model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (defaults to OLLAMA_MODEL env var, or gemma4:e4b)"),
     window_index: z.number().int().min(1).optional().default(1).describe("Which window to capture if the app has multiple (1 = frontmost)"),
-    zoom: z.boolean().optional().default(false).describe("Two-pass zoom: first locate a rough bounding box, then crop and refine. More accurate for small elements like close buttons or icons."),
     viewport_bounds: z.object({
       x: z.number().describe("Left edge of viewport in screen coordinates"),
       y: z.number().describe("Top edge of viewport in screen coordinates"),
@@ -435,7 +434,7 @@ server.tool(
       "When provided, returned coordinates are relative to this region's (0,0) — viewport-relative for Chrome."
     ),
   },
-  async ({ app_name, element_description, model, window_index, zoom, viewport_bounds }) => {
+  async ({ app_name, element_description, model, window_index, viewport_bounds }) => {
     // --- Determine capture region ---
     // If viewport_bounds is provided, capture exactly that region and return coords relative to its (0,0).
     // Otherwise, fall back to full window bounds and return absolute screen coordinates.
@@ -488,116 +487,27 @@ server.tool(
       const imgWidth = wMatch ? parseInt(wMatch[1]) : captureWidth;
       const imgHeight = hMatch ? parseInt(hMatch[1]) : captureHeight;
 
-      let fracX = 0;
-      let fracY = 0;
-      let confidence: string | undefined;
-      let clamped = false;
-      let zoomSucceeded = false;
+      const prompt =
+        `Find this UI element in the screenshot: "${element_description}"\n\n` +
+        `Return ONLY valid JSON (no other text):\n` +
+        `{"found": true|false, "x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
+        `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Return the CENTER point of the element. ` +
+        `Set found to false if the element is not visible.`;
 
-      if (zoom) {
-        // Pass 1 — rough bounding box
-        const roughPrompt =
-          `Find this UI element in the screenshot: "${element_description}"\n\n` +
-          `Return ONLY valid JSON (no other text):\n` +
-          `{"found": true|false, "x": <left edge 0-1>, "y": <top edge 0-1>, "width": <width 0-1>, "height": <height 0-1>}\n\n` +
-          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Cover the element with some padding. ` +
-          `Set found to false if the element is not visible.`;
+      const result = await queryOllamaJson<{ found?: boolean; x: number; y: number; confidence?: string }>(
+        readFileSync(screenshotPath).toString("base64"), prompt, model!
+      );
 
-        const rough = await queryOllamaJson<{ found?: boolean; x: number; y: number; width: number; height: number }>(
-          readFileSync(screenshotPath).toString("base64"), roughPrompt, model!
-        );
-
-        if (rough.found !== false) {
-          const rawRx = rough.x ?? 0;
-          const rawRy = rough.y ?? 0;
-          const rawRw = rough.width ?? 0.1;
-          const rawRh = rough.height ?? 0.1;
-          const rx = Math.max(0, Math.min(0.99, rawRx));
-          const ry = Math.max(0, Math.min(0.99, rawRy));
-          const rw = Math.max(0.01, Math.min(1 - rx, rawRw));
-          const rh = Math.max(0.01, Math.min(1 - ry, rawRh));
-          clamped = rx !== rawRx || ry !== rawRy || rw !== rawRw || rh !== rawRh;
-
-          // Crop to the rough region for a closer look
-          const cropX = Math.round(rx * imgWidth);
-          const cropY = Math.round(ry * imgHeight);
-          const cropW = Math.max(1, Math.round(rw * imgWidth));
-          const cropH = Math.max(1, Math.round(rh * imgHeight));
-
-          const croppedPath = join(tmpDir, "cropped.png");
-          copyFileSync(screenshotPath, croppedPath);
-          await execFileAsync("sips", [
-            "--cropToHeightWidth", String(cropH), String(cropW),
-            "--cropOffset", String(cropY), String(cropX),
-            croppedPath, "--out", croppedPath,
-          ]);
-
-          // Upscale small crops so the model's 280-token image budget isn't wasted
-          // on a tiny region. Target a minimum of 400px on the short side.
-          const minSide = Math.min(cropW, cropH);
-          if (minSide < 400) {
-            const upscale = Math.ceil(400 / minSide);
-            await execFileAsync("sips", [
-              "-z", String(cropH * upscale), String(cropW * upscale),
-              croppedPath, "--out", croppedPath,
-            ]);
-          }
-
-          // Pass 2 — precise center within the crop
-          const precisePrompt =
-            `This is a zoomed-in region of a UI screenshot. Find: "${element_description}"\n\n` +
-            `Return ONLY valid JSON (no other text):\n` +
-            `{"found": true|false, "x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
-            `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom of THIS cropped image. Return the CENTER of the element. ` +
-            `Set found to false if the element is not visible.`;
-
-          const precise = await queryOllamaJson<{ found?: boolean; x: number; y: number; confidence?: string }>(
-            readFileSync(croppedPath).toString("base64"), precisePrompt, model!
-          );
-
-          if (precise.found === false) {
-            throw new Error(`Element not found: "${element_description}"`);
-          }
-
-          const rawPx = precise.x ?? 0.5;
-          const rawPy = precise.y ?? 0.5;
-          const px = Math.max(0, Math.min(1, rawPx));
-          const py = Math.max(0, Math.min(1, rawPy));
-          clamped = clamped || px !== rawPx || py !== rawPy;
-
-          // Convert crop-relative fractions back to full-capture fractions
-          fracX = rx + px * rw;
-          fracY = ry + py * rh;
-          confidence = precise.confidence;
-          zoomSucceeded = true;
-        }
-        // if rough.found === false: zoomSucceeded stays false, single-pass runs below
+      if (result.found === false) {
+        throw new Error(`Element not found: "${element_description}"`);
       }
 
-      if (!zoom || !zoomSucceeded) {
-        // Single pass (also used as fallback when zoom pass-1 returns found:false)
-        const prompt =
-          `Find this UI element in the screenshot: "${element_description}"\n\n` +
-          `Return ONLY valid JSON (no other text):\n` +
-          `{"found": true|false, "x": <center x 0-1>, "y": <center y 0-1>, "confidence": "high"|"medium"|"low"}\n\n` +
-          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Return the CENTER point of the element. ` +
-          `Set found to false if the element is not visible.`;
-
-        const result = await queryOllamaJson<{ found?: boolean; x: number; y: number; confidence?: string }>(
-          readFileSync(screenshotPath).toString("base64"), prompt, model!
-        );
-
-        if (result.found === false) {
-          throw new Error(`Element not found: "${element_description}"`);
-        }
-
-        const rawX = result.x ?? 0.5;
-        const rawY = result.y ?? 0.5;
-        fracX = Math.max(0, Math.min(1, rawX));
-        fracY = Math.max(0, Math.min(1, rawY));
-        clamped = fracX !== rawX || fracY !== rawY;
-        confidence = result.confidence;
-      }
+      const rawX = result.x ?? 0.5;
+      const rawY = result.y ?? 0.5;
+      const fracX = Math.max(0, Math.min(1, rawX));
+      const fracY = Math.max(0, Math.min(1, rawY));
+      const clamped = fracX !== rawX || fracY !== rawY;
+      const confidence = result.confidence;
 
       // Convert fractions to output coordinates.
       // Retina scale cancels out: fractions of physical pixels = fractions of logical pixels.
