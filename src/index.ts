@@ -135,7 +135,8 @@ async function queryOllamaJson<T>(imageBase64: string, prompt: string, model: st
         stream: false,
         format: "json",
       }),
-      signal: AbortSignal.timeout(120000),
+      // Always exactly 1 image in JSON mode; use the same base+per-image formula as queryOllama.
+      signal: AbortSignal.timeout(90000),
     });
   } catch (err) {
     throw new Error(`Ollama request failed: ${String(err)}`);
@@ -199,7 +200,7 @@ server.tool(
   {
     url: z.string().url().describe("URL to screenshot (e.g. http://localhost:3004)"),
     question: z.string().describe("What to analyze or look for in the screenshot"),
-    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (overrides OLLAMA_MODEL env var)"),
+    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (defaults to OLLAMA_MODEL env var, or gemma4:e4b)"),
     viewport_width: z.number().int().positive().optional().default(1280).describe("Viewport width in pixels"),
     viewport_height: z.number().int().positive().optional().default(800).describe("Viewport height in pixels"),
     wait_ms: z.number().int().min(0).optional().default(2000).describe("Milliseconds to wait after page load for JS rendering"),
@@ -307,7 +308,7 @@ server.tool(
   {
     app_name: z.string().describe("Exact macOS app name, e.g. 'Google Chrome', 'Safari', 'Terminal', 'Cursor'"),
     question: z.string().describe("What to analyze or look for in the screenshot"),
-    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (overrides OLLAMA_MODEL env var)"),
+    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (defaults to OLLAMA_MODEL env var, or gemma4:e4b)"),
     window_index: z.number().int().min(1).optional().default(1).describe("Which window to capture if the app has multiple (1 = frontmost)"),
     scale: z.number().int().min(1).max(4).optional().default(1).describe("Upscale factor applied before sending to the vision model. Use 2 or 3 for small terminal text or dense UIs."),
     crop: z.object({
@@ -409,7 +410,7 @@ server.tool(
   {
     app_name: z.string().describe("Exact macOS app name, e.g. 'Google Chrome', 'Safari', 'Terminal', 'Cursor'"),
     element_description: z.string().describe("Natural language description of the element to find, e.g. 'the X close button in the top-right of the modal'"),
-    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (overrides OLLAMA_MODEL env var)"),
+    model: z.string().optional().default(OLLAMA_DEFAULT_MODEL).describe("Ollama vision model to use (defaults to OLLAMA_MODEL env var, or gemma4:e4b)"),
     window_index: z.number().int().min(1).optional().default(1).describe("Which window to capture if the app has multiple (1 = frontmost)"),
     zoom: z.boolean().optional().default(false).describe("Two-pass zoom: first locate a rough bounding box, then crop and refine. More accurate for small elements like close buttons or icons."),
     viewport_bounds: z.object({
@@ -486,12 +487,17 @@ server.tool(
         const roughPrompt =
           `Find this UI element in the screenshot: "${element_description}"\n\n` +
           `Return ONLY valid JSON (no other text):\n` +
-          `{"x": <left edge 0-1>, "y": <top edge 0-1>, "width": <width 0-1>, "height": <height 0-1>}\n\n` +
-          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Cover the element with some padding.`;
+          `{"found": true|false, "x": <left edge 0-1>, "y": <top edge 0-1>, "width": <width 0-1>, "height": <height 0-1>}\n\n` +
+          `x=0 is left, x=1 is right, y=0 is top, y=1 is bottom. Cover the element with some padding. ` +
+          `Set found to false if the element is not visible.`;
 
-        const rough = await queryOllamaJson<{ x: number; y: number; width: number; height: number }>(
+        const rough = await queryOllamaJson<{ found?: boolean; x: number; y: number; width: number; height: number }>(
           readFileSync(screenshotPath).toString("base64"), roughPrompt, model!
         );
+
+        if (rough.found === false) {
+          throw new Error(`Element not found: "${element_description}"`);
+        }
 
         const rx = Math.max(0, Math.min(0.99, rough.x ?? 0));
         const ry = Math.max(0, Math.min(0.99, rough.y ?? 0));
