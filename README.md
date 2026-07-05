@@ -30,6 +30,7 @@ Three tools are provided:
 git clone git@github.com:AVS845/screenshot-vision-mcp.git
 cd screenshot-vision-mcp
 npm install
+npx playwright install chromium
 npm run build
 ```
 

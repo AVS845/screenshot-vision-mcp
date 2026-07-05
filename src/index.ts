@@ -45,12 +45,22 @@ async function startOllama(): Promise<void> {
   } catch (err) {
     throw new Error(`Could not start Ollama (is it installed?): ${String(err)}`);
   }
+
+  let earlyExitReason: string | null = null;
+  child.on("exit", (code, signal) => {
+    if (signal !== null) {
+      earlyExitReason = `Ollama was killed by signal ${signal}`;
+    } else if (code !== 0) {
+      earlyExitReason = `Ollama exited immediately with code ${code} — port 11434 may already be in use (run: lsof -i :11434)`;
+    }
+  });
   child.unref();
 
   // Poll until Ollama responds, up to 30 s.
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 500));
+    if (earlyExitReason !== null) throw new Error(earlyExitReason);
     if (await isOllamaRunning()) return;
   }
   throw new Error("Ollama did not become ready within 30 s after being started.");
@@ -285,7 +295,7 @@ server.tool(
 
     // Prepend slice context so the model knows it's reading a sequence of page segments.
     const effectiveQuestion = sliceCount > 1
-      ? `You are analyzing ${sliceCount} slices of a full web page, ordered top to bottom. Slice 1 is the topmost portion and slice ${sliceCount} is the bottommost.\n\n${question}`
+      ? `You are analyzing ${sliceCount} overlapping scroll-window captures of a single web page, from top to bottom. Adjacent slices overlap — the same content may appear in more than one image. List each piece of content ONCE only. Do not invent structure that isn't present. Slice 1 shows the top of the page; slice ${sliceCount} shows the bottom.\n\n${question}`
       : question;
 
     const analysis = await queryOllama(images, effectiveQuestion, model!);
@@ -481,6 +491,7 @@ server.tool(
       let fracX: number;
       let fracY: number;
       let confidence: string | undefined;
+      let clamped = false;
 
       if (zoom) {
         // Pass 1 — rough bounding box
@@ -499,10 +510,15 @@ server.tool(
           throw new Error(`Element not found: "${element_description}"`);
         }
 
-        const rx = Math.max(0, Math.min(0.99, rough.x ?? 0));
-        const ry = Math.max(0, Math.min(0.99, rough.y ?? 0));
-        const rw = Math.max(0.01, Math.min(1 - rx, rough.width ?? 0.1));
-        const rh = Math.max(0.01, Math.min(1 - ry, rough.height ?? 0.1));
+        const rawRx = rough.x ?? 0;
+        const rawRy = rough.y ?? 0;
+        const rawRw = rough.width ?? 0.1;
+        const rawRh = rough.height ?? 0.1;
+        const rx = Math.max(0, Math.min(0.99, rawRx));
+        const ry = Math.max(0, Math.min(0.99, rawRy));
+        const rw = Math.max(0.01, Math.min(1 - rx, rawRw));
+        const rh = Math.max(0.01, Math.min(1 - ry, rawRh));
+        clamped = rx !== rawRx || ry !== rawRy || rw !== rawRw || rh !== rawRh;
 
         // Crop to the rough region for a closer look
         const cropX = Math.round(rx * imgWidth);
@@ -545,8 +561,11 @@ server.tool(
           throw new Error(`Element not found: "${element_description}"`);
         }
 
-        const px = Math.max(0, Math.min(1, precise.x ?? 0.5));
-        const py = Math.max(0, Math.min(1, precise.y ?? 0.5));
+        const rawPx = precise.x ?? 0.5;
+        const rawPy = precise.y ?? 0.5;
+        const px = Math.max(0, Math.min(1, rawPx));
+        const py = Math.max(0, Math.min(1, rawPy));
+        clamped = clamped || px !== rawPx || py !== rawPy;
 
         // Convert crop-relative fractions back to full-capture fractions
         fracX = rx + px * rw;
@@ -569,8 +588,11 @@ server.tool(
           throw new Error(`Element not found: "${element_description}"`);
         }
 
-        fracX = Math.max(0, Math.min(1, result.x ?? 0.5));
-        fracY = Math.max(0, Math.min(1, result.y ?? 0.5));
+        const rawX = result.x ?? 0.5;
+        const rawY = result.y ?? 0.5;
+        fracX = Math.max(0, Math.min(1, rawX));
+        fracY = Math.max(0, Math.min(1, rawY));
+        clamped = fracX !== rawX || fracY !== rawY;
         confidence = result.confidence;
       }
 
@@ -593,7 +615,7 @@ server.tool(
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ x, y, coordinate_mode: coordinateMode, ...(confidence ? { confidence } : {}) }),
+            text: JSON.stringify({ x, y, coordinate_mode: coordinateMode, ...(confidence ? { confidence } : {}), ...(clamped ? { clamped: true } : {}) }),
           },
         ],
       };
