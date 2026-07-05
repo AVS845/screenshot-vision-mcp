@@ -1,14 +1,14 @@
 # screenshot-vision-mcp
 
-An MCP server for Claude Code that takes screenshots and analyzes them with a **local Ollama vision model** — no image data ever leaves your machine, and it costs zero vision tokens.
-
-Three tools are provided:
+When reviewing a PR locally, you need to see if the UI looks right. Normally that means Claude takes a screenshot — which burns vision tokens and sends your screen contents to Anthropic. This MCP server routes screenshots through a **local Ollama vision model** instead: zero token cost, nothing leaves your machine.
 
 | Tool | When to use |
 |---|---|
-| `analyze_screenshot` | Public or local URLs — opens a headless browser, no session |
+| `analyze_screenshot` | Public or local URLs — headless browser, no session needed |
 | `capture_window` | Any app window on screen — sees your real logged-in session |
-| `locate_element` | Find a UI element and return click coordinates — Claude never sees the image |
+| `locate_element` | Native macOS apps only — returns click coordinates without Claude seeing the image |
+
+> **Chrome automation:** for clicking elements in Chrome, prefer `javascript_tool + getBoundingClientRect` — it's exact and requires no vision at all. See [Clicking in Chrome](#clicking-in-chrome).
 
 ---
 
@@ -60,28 +60,20 @@ Two optional env vars let you configure the server without touching call sites:
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama host |
 | `OLLAMA_MODEL` | `gemma4:e4b` | Default vision model for all tools |
 
-```json
-{
-  "mcpServers": {
-    "screenshot-vision": {
-      "command": "node",
-      "args": ["/absolute/path/to/screenshot-vision-mcp/dist/index.js"],
-      "env": {
-        "OLLAMA_URL": "http://192.168.1.10:11434",
-        "OLLAMA_MODEL": "llava"
-      }
-    }
-  }
-}
-```
-
 ---
 
 ## Tools
 
 ### `analyze_screenshot`
 
-Takes a screenshot of a URL in a headless Playwright browser and analyzes it.
+Takes a screenshot of a URL in a headless Playwright browser and analyzes it with Ollama.
+
+```
+analyze_screenshot(
+  url: "http://localhost:3004/dashboard",
+  question: "Does the revenue chart render correctly? Are there any layout issues?"
+)
+```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -91,14 +83,23 @@ Takes a screenshot of a URL in a headless Playwright browser and analyzes it.
 | `viewport_width` | number | `1280` | Viewport width in px |
 | `viewport_height` | number | `800` | Viewport height in px |
 | `wait_ms` | number | `2000` | Wait after page load (ms) |
-| `full_page` | boolean | `false` | Capture the full page height, not just the visible viewport |
+| `full_page` | boolean | `false` | Capture full page height, not just the visible viewport |
 | `max_slices` | number | `8` | Max slices when `full_page` is true (1–20) |
 
-When `full_page: true`, the tool captures the entire page as one tall PNG, then slices it into `viewport_height`-tall segments distributed evenly from top to bottom. Each slice is sent as a separate image in a single Ollama request, with a prompt that tells the model the slice order. This matters because Ollama caps Gemma 4's image token budget at 280 tokens — a single tall image gets crushed into noise, while N properly-proportioned slices each get full detail.
+When `full_page: true`, the page is sliced into `viewport_height`-tall segments and sent as multiple images. This matters because Gemma 4's image token budget is ~280 tokens — a single tall screenshot gets crushed into noise, while properly-proportioned slices each get full detail.
+
+---
 
 ### `capture_window`
 
-Captures a specific app window currently on screen and analyzes it. Useful for testing local apps where you're already logged in.
+Captures an app window currently on screen and analyzes it. Use this when the page requires a login — it sees your real browser session.
+
+```
+capture_window(
+  app_name: "Google Chrome",
+  question: "Is the form validation error displaying correctly under the email field?"
+)
+```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -109,48 +110,51 @@ Captures a specific app window currently on screen and analyzes it. Useful for t
 | `scale` | number | `1` | Upscale factor (2–3 helps with small text) |
 | `crop` | object | — | Crop to a sub-region before analysis |
 
-The `crop` parameter takes fractional values (0–1):
+The `crop` parameter uses fractional values (0–1). To inspect just the bottom half of the window:
 
 ```json
 { "x": 0, "y": 0.5, "width": 1, "height": 0.5 }
 ```
 
-That example crops to the bottom half of the window.
+---
 
 ### `locate_element`
 
-Finds a UI element in an app window and returns its click coordinates. Ollama does the visual work — Claude never sees the image.
+Finds a UI element in a native macOS app window and returns its click coordinates. Designed for apps where DOM access isn't available — Terminal, Figma, Xcode, etc.
+
+> **Not recommended for Chrome.** Chrome's DOM gives exact coordinates with no vision model involved. See [Clicking in Chrome](#clicking-in-chrome).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `app_name` | string | — | Exact macOS app name, e.g. `"Google Chrome"` |
-| `element_description` | string | — | Natural language description of the element to find |
+| `app_name` | string | — | Exact macOS app name, e.g. `"Figma"`, `"Terminal"` |
+| `element_description` | string | — | Natural language description of the element |
 | `model` | string | `gemma4:e4b` | Ollama vision model |
 | `window_index` | number | `1` | Which window (1 = frontmost) |
-| `zoom` | boolean | `false` | Two-pass refinement — first finds a rough bounding box, then crops and refines. Recommended for small targets like close buttons |
-| `viewport_bounds` | object | — | Screen-coordinate bounds of the region to capture (see Chrome usage below) |
+| `viewport_bounds` | object | — | Screen-coordinate bounds of the region to capture |
 
-Returns `{ x, y, coordinate_mode }` where `coordinate_mode` is `"viewport"` (when `viewport_bounds` is passed) or `"screen"`.
+Returns `{ x, y, coordinate_mode, clamped }`. `clamped: true` means the model returned out-of-range coordinates that were corrected — treat as low confidence.
 
-#### Usage with Google Chrome
+**Accuracy note:** `gemma4:e4b` has a ~280-token image budget, which limits spatial precision. Elements in the center of the screen locate reliably; elements near edges may have 50–150px errors. Use a larger model (e.g. `gemma4:26b`) if precision matters, at the cost of slower inference.
 
-The Chrome `computer` tool uses viewport-relative coordinates. Pass `viewport_bounds` so the returned `{x, y}` can be used directly.
+---
 
-**Prefer `getBoundingClientRect` for standard HTML elements** — it's exact and requires no image:
+## Clicking in Chrome
+
+For Chrome browser automation, skip `locate_element` entirely. Use `javascript_tool` to get exact coordinates from the DOM:
 
 ```javascript
-// javascript_tool → perfect viewport coordinates, no vision needed
+// In javascript_tool — returns perfect viewport coordinates, no vision needed
 const el = document.querySelector('button.submit');
 const r = el.getBoundingClientRect();
 JSON.stringify({ x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) });
 ```
 
-Use `locate_element` for elements that can't be DOM-queried (canvas, rendered images, visually-composed widgets).
+Only fall back to `locate_element` for elements that genuinely can't be DOM-queried (canvas content, rendered images, visually-composed widgets without CSS selectors). When you do, pass `viewport_bounds` so the returned coordinates are viewport-relative and work directly with the Chrome `computer` tool.
 
-When using `locate_element` with Chrome, **measure viewport bounds immediately before the call** — the Chrome automation InfoBar temporarily reduces `innerHeight`, causing ~40px y-offset errors if you use stale bounds:
+**Measure viewport bounds immediately before the call** — the Chrome automation InfoBar shifts `innerHeight`, causing ~40px errors with stale bounds:
 
 ```javascript
-// javascript_tool — run this right before locate_element, not once per session
+// javascript_tool — run right before locate_element
 JSON.stringify({
   screenX: window.screenX,
   screenY: window.screenY,
@@ -160,13 +164,10 @@ JSON.stringify({
 })
 ```
 
-Then call `locate_element`:
-
 ```
 locate_element(
   app_name: "Google Chrome",
-  element_description: "the X close button in the top-right of the modal",
-  zoom: true,
+  element_description: "the close button on the confirmation modal",
   viewport_bounds: {
     x: screenX,
     y: screenY + outerHeight - innerHeight,
@@ -177,15 +178,13 @@ locate_element(
 → { x: 891, y: 267, coordinate_mode: "viewport" }
 ```
 
-Pass `x`/`y` directly to the Chrome `computer` tool's click action.
-
 ---
 
 ## How it works
 
 1. **`analyze_screenshot`** launches a headless Chromium browser via Playwright, navigates to the URL, waits for JS to settle, and captures a PNG.
 2. **`capture_window`** uses AppleScript to get the window bounds, `screencapture -R` to grab exactly that region, and optionally `sips` to crop and scale.
-3. **`locate_element`** captures the specified region (or full window), asks Ollama to return element coordinates as JSON fractions (0–1), then converts to pixel coordinates. With `zoom: true`, it does a two-pass crop for higher accuracy.
+3. **`locate_element`** captures the specified region, asks Ollama to return element coordinates as JSON fractions (0–1), then converts to pixel coordinates.
 4. All tools base64-encode the PNG and POST it to Ollama's `/api/generate` endpoint.
 5. If Ollama isn't running, the server spawns `ollama serve` and waits up to 30 seconds for it to become ready.
 
